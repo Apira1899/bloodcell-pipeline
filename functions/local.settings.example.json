@@ -1,0 +1,14 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "PIPELINE_STORAGE__queueServiceUri": "https://<storage-account>.queue.core.windows.net",
+    "PIPELINE_STORAGE__blobServiceUri": "https://<storage-account>.blob.core.windows.net",
+    "STORAGE_ACCOUNT_URL": "https://<storage-account>.blob.core.windows.net",
+    "API_URL": "http://localhost:8000",
+    "COSMOS_ENDPOINT": "https://<cosmos-account>.documents.azure.com:443/",
+    "COSMOS_DB": "pipeline",
+    "COSMOS_CONTAINER": "inferences"
+  }
+}
