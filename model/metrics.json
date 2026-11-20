@@ -1,0 +1,46 @@
+{
+  "model_version": "1.0.0",
+  "selected_model": "ResNet-18 (fine-tuned)",
+  "dataset": {
+    "name": "BloodMNIST (MedMNIST v2)",
+    "url": "https://medmnist.com/",
+    "licence": "CC BY 4.0",
+    "image_size": "28x28 RGB",
+    "n_train": 11959,
+    "n_val": 1712,
+    "n_test": 3421
+  },
+  "seed": 42,
+  "test_metrics": {
+    "Baseline: most frequent": {
+      "accuracy": 0.1947,
+      "macro_f1": 0.0407
+    },
+    "Baseline: PCA + LogReg": {
+      "accuracy": 0.7738,
+      "macro_f1": 0.7442
+    },
+    "SmallCNN (from scratch)": {
+      "accuracy": 0.9702,
+      "macro_f1": 0.9678
+    },
+    "ResNet-18 (fine-tuned)": {
+      "accuracy": 0.9711,
+      "macro_f1": 0.9688
+    },
+    "Final ONNX model": {
+      "accuracy": 0.9711,
+      "macro_f1": 0.9688
+    }
+  },
+  "cpu_latency_ms_1_thread": {
+    "mean": 5.45,
+    "p95": 6.29
+  },
+  "onnx_size_mb": 44.72,
+  "trained_on": {
+    "device": "cuda",
+    "torch": "2.14.1+cu130",
+    "python": "3.13.16"
+  }
+}

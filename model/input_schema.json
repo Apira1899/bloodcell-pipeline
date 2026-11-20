@@ -1,0 +1,37 @@
+{
+  "accepted_extensions": [
+    ".png",
+    ".jpg",
+    ".jpeg"
+  ],
+  "max_file_size_bytes": 1000000,
+  "image": {
+    "mode": "RGB",
+    "resize_to": [
+      28,
+      28
+    ]
+  },
+  "onnx_input": {
+    "name": "image",
+    "dtype": "float32",
+    "shape": [
+      "batch",
+      3,
+      28,
+      28
+    ],
+    "range": [
+      0,
+      1
+    ]
+  },
+  "onnx_output": {
+    "name": "probabilities",
+    "dtype": "float32",
+    "shape": [
+      "batch",
+      8
+    ]
+  }
+}

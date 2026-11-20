@@ -1,0 +1,15 @@
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+.git
+.github
+docs
+web
+functions
+infra
+api/tests
+**/*.npz
+**/*.ipynb
+**/.venv
+**/.env
