@@ -3,7 +3,7 @@ import hashlib
 import io
 import os
 import posixpath
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from PIL import Image, UnidentifiedImageError
 
@@ -92,4 +92,4 @@ def build_record(msg: dict, prediction: dict, duration_ms: float) -> dict:
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    return datetime.now(UTC).isoformat(timespec="milliseconds")
