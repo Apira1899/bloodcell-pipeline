@@ -1,0 +1,70 @@
+name: Deploy
+
+# Runs after CI succeeds on main (so the image for this commit already exists in GHCR),
+# or manually from the Actions tab.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write      # needed for the OIDC token (no Azure secret stored in GitHub)
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-projet-bcellaj
+  CONTAINER_APP: api-bcellaj
+  FUNCTION_APP: func-bcellaj
+  API_VERSION: "1.0.0"
+  MODEL_VERSION: "1.0.0"
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: production          # manual approval by the required reviewer
+    steps:
+      - name: Commit to deploy
+        id: sha
+        run: |
+          SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/api:$SHA" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.sha.outputs.sha }}
+
+      - name: Azure login (OIDC, user-assigned managed identity)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Update the API (Container Apps)
+        run: |
+          az containerapp update -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" \
+            --image "${{ steps.sha.outputs.image }}" \
+            --set-env-vars GIT_SHA=${{ steps.sha.outputs.sha }} API_VERSION=$API_VERSION MODEL_VERSION=$MODEL_VERSION \
+            --query "properties.latestRevisionName" -o tsv
+
+      - name: Deploy the Function App
+        working-directory: functions
+        run: |
+          zip -qr ../functions.zip . -x "tests/*" "*.pyc"
+          az functionapp deployment source config-zip -g "$RESOURCE_GROUP" -n "$FUNCTION_APP" \
+            --src ../functions.zip --build-remote true
+
+      - name: Smoke test – GET /version must show this commit
+        run: |
+          URL="https://$(az containerapp show -n "$CONTAINER_APP" -g "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)"
+          for i in $(seq 1 12); do
+            BODY=$(curl -s --max-time 30 "$URL/version" || true)
+            echo "$BODY"
+            echo "$BODY" | grep -q "${{ steps.sha.outputs.sha }}" && { echo "Deployed commit is live"; exit 0; }
+            sleep 10
+          done
+          echo "New revision not live after 2 minutes"; exit 1

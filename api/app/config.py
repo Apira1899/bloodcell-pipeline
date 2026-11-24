@@ -3,6 +3,7 @@ import os
 
 API_VERSION = os.getenv("API_VERSION", "1.0.0")
 MODEL_VERSION = os.getenv("MODEL_VERSION", "1.0.0")
+GIT_SHA = os.getenv("GIT_SHA", "local")  # set by deploy.yml -> proves which commit is live
 MODEL_PATH = os.getenv("MODEL_PATH", f"/app/model/model-{MODEL_VERSION}.onnx")
 LABELS_PATH = os.getenv("LABELS_PATH", "/app/model/labels.json")
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", "1000000"))  # 1 MB, same as input_schema.json

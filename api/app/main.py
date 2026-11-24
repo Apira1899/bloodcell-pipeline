@@ -91,7 +91,7 @@ def health():
 
 @app.get("/version")
 def version():
-    return {"api_version": config.API_VERSION, "model_version": config.MODEL_VERSION}
+    return {"api_version": config.API_VERSION, "model_version": config.MODEL_VERSION, "git_sha": config.GIT_SHA}
 
 
 @app.post("/predict", response_model=PredictResponse)

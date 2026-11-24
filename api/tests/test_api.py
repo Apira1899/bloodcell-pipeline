@@ -48,7 +48,9 @@ def test_health(client):
 
 
 def test_version(client):
-    assert client.get("/version").json() == {"api_version": "1.0.0", "model_version": "1.0.0-test"}
+    body = client.get("/version").json()
+    assert body["api_version"] == "1.0.0" and body["model_version"] == "1.0.0-test"
+    assert "git_sha" in body
 
 
 def test_metrics_counts_calls(client, png_b64):
