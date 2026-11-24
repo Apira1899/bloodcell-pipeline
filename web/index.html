@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BloodCell pipeline – live dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2330; --muted:#6b7280; --line:#e5e7eb; --accent:#b4233c; --ok:#15803d; --warn:#b45309; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--ink); }
+  header { padding:20px 28px; background:var(--card); border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
+  h1 { font-size:20px; margin:0; } h1 span { color:var(--accent); }
+  .sub { color:var(--muted); font-size:13px; }
+  main { padding:24px 28px; max-width:1200px; margin:0 auto; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:14px; margin-bottom:18px; }
+  .tile, .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .tile .v { font-size:26px; font-weight:650; margin-top:4px; font-variant-numeric: tabular-nums; }
+  .tile .k { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap:14px; margin-bottom:18px; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  .card h2 { font-size:14px; margin:0 0 12px; }
+  .chart { position:relative; height:260px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; font-size:12px; }
+  td.num { text-align:right; font-variant-numeric: tabular-nums; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#fdecee; color:var(--accent); font-weight:600; font-size:12px; }
+  .conf-high { color:var(--ok); } .conf-low { color:var(--warn); }
+  .status { font-size:13px; } .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background:var(--ok); }
+  .status.err .dot { background:var(--accent); }
+  .empty { color:var(--muted); padding:24px; text-align:center; }
+  .new { animation: flash 2s ease-out; } @keyframes flash { from { background:#fff4c2; } to { background:transparent; } }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Blood<span>Cell</span> pipeline – live dashboard</h1>
+    <div class="sub">Event-driven ML on Azure · BloodMNIST · last 20 inferences · auto-refresh every 30 s</div>
+  </div>
+  <div class="status" id="status"><span class="dot"></span>connecting…</div>
+</header>
+<main>
+  <section class="tiles">
+    <div class="tile"><div class="k">Inferences shown</div><div class="v" id="t-count">–</div></div>
+    <div class="tile"><div class="k">Avg confidence</div><div class="v" id="t-conf">–</div></div>
+    <div class="tile"><div class="k">Avg pipeline time</div><div class="v" id="t-dur">–</div></div>
+    <div class="tile"><div class="k">Avg model latency</div><div class="v" id="t-lat">–</div></div>
+    <div class="tile"><div class="k">Model version</div><div class="v" id="t-ver">–</div></div>
+  </section>
+
+  <section class="grid">
+    <div class="card"><h2>Predictions by cell type</h2><div class="chart"><canvas id="c-types"></canvas></div></div>
+    <div class="card"><h2>Confidence of recent predictions</h2><div class="chart"><canvas id="c-conf"></canvas></div></div>
+  </section>
+
+  <section class="card">
+    <h2>Last 20 inferences</h2>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>Time</th><th>File</th><th>Prediction</th><th style="text-align:right">Confidence</th>
+          <th style="text-align:right">Pipeline (ms)</th><th style="text-align:right">Model (ms)</th><th>Model</th></tr></thead>
+        <tbody id="rows"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+  // ---- Configuration: URL of the HTTP function (no secret: the endpoint is public, CORS restricts the origin)
+  const API = "https://func-bcellaj.azurewebsites.net/api/recent";
+  const REFRESH_MS = 30000;
+
+  const CLASSES = ["basophil","eosinophil","erythroblast","immature granulocytes","lymphocyte","monocyte","neutrophil","platelet"];
+  const short = n => (n || "").startsWith("immature granulocytes") ? "immature granulocytes" : (n || "?");
+  const COLORS = ["#4e79a7","#f28e2b","#e15759","#76b7b2","#59a14f","#edc948","#b07aa1","#9c755f"];
+  const colorOf = n => COLORS[Math.max(0, CLASSES.indexOf(short(n)))];
+
+  const typesChart = new Chart(document.getElementById("c-types"), {
+    type: "bar",
+    data: { labels: CLASSES, datasets: [{ data: CLASSES.map(() => 0), backgroundColor: COLORS }] },
+    options: { maintainAspectRatio:false, plugins:{ legend:{ display:false } },
+               scales:{ y:{ beginAtZero:true, ticks:{ precision:0 } }, x:{ ticks:{ autoSkip:false, maxRotation:35 } } } }
+  });
+  const confChart = new Chart(document.getElementById("c-conf"), {
+    type: "line",
+    data: { labels: [], datasets: [{ label:"confidence", data: [], tension:.25, pointRadius:4,
+            borderColor:"#b4233c", backgroundColor:"rgba(180,35,60,.12)", fill:true, pointBackgroundColor:[] }] },
+    options: { maintainAspectRatio:false, plugins:{ legend:{ display:false },
+               tooltip:{ callbacks:{ title: items => items[0].label + "  " + (confChart.$files?.[items[0].dataIndex] ?? ""), label: c => " " + (c.raw*100).toFixed(1) + " %" } } },
+               scales:{ y:{ min:0, max:1, ticks:{ callback: v => (v*100) + "%" } } } }
+  });
+
+  let seen = new Set();
+  const fmtTime = ts => new Date(ts).toLocaleTimeString([], { hour:"2-digit", minute:"2-digit", second:"2-digit" });
+  const avg = a => a.length ? a.reduce((s, x) => s + x, 0) / a.length : null;
+
+  function cell(text, cls) { const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; return td; }
+
+  function render(items) {
+    // Tiles
+    document.getElementById("t-count").textContent = items.length;
+    const c = avg(items.map(i => i.confidence).filter(Number.isFinite));
+    const d = avg(items.map(i => i.durationMs).filter(Number.isFinite));
+    const l = avg(items.map(i => i.modelLatencyMs).filter(Number.isFinite));
+    document.getElementById("t-conf").textContent = c == null ? "–" : (c*100).toFixed(1) + " %";
+    document.getElementById("t-dur").textContent = d == null ? "–" : Math.round(d) + " ms";
+    document.getElementById("t-lat").textContent = l == null ? "–" : l.toFixed(1) + " ms";
+    document.getElementById("t-ver").textContent = items[0]?.modelVersion ?? "–";
+
+    // Bar chart: count per class
+    const counts = CLASSES.map(k => items.filter(i => short(i.prediction) === k).length);
+    typesChart.data.datasets[0].data = counts; typesChart.update();
+
+    // Line chart: oldest -> newest
+    const chrono = [...items].reverse();
+    confChart.data.labels = chrono.map(i => fmtTime(i.timestamp));
+    confChart.$files = chrono.map(i => i.fileName + " → " + short(i.prediction));
+    confChart.data.datasets[0].data = chrono.map(i => i.confidence);
+    confChart.data.datasets[0].pointBackgroundColor = chrono.map(i => colorOf(i.prediction));
+    confChart.update();
+
+    // Table (textContent only -> no HTML injection from file names)
+    const tbody = document.getElementById("rows");
+    tbody.replaceChildren();
+    if (!items.length) { const tr = document.createElement("tr"); const td = cell("No inference yet – upload an image to the input/ container.", "empty"); td.colSpan = 7; tr.append(td); tbody.append(tr); }
+    for (const i of items) {
+      const tr = document.createElement("tr");
+      if (seen.size && !seen.has(i.id)) tr.className = "new";
+      const pill = document.createElement("span"); pill.className = "pill"; pill.textContent = short(i.prediction);
+      pill.style.background = colorOf(i.prediction) + "22"; pill.style.color = colorOf(i.prediction);
+      const pred = document.createElement("td"); pred.append(pill);
+      tr.append(cell(fmtTime(i.timestamp)), cell(i.fileName), pred,
+                cell(((i.confidence ?? 0)*100).toFixed(1) + " %", "num " + (i.confidence >= 0.8 ? "conf-high" : i.confidence < 0.5 ? "conf-low" : "")),
+                cell(i.durationMs != null ? Math.round(i.durationMs) : "–", "num"),
+                cell(i.modelLatencyMs != null ? i.modelLatencyMs.toFixed(1) : "–", "num"),
+                cell(i.modelVersion ?? "–"));
+      tbody.append(tr);
+    }
+    seen = new Set(items.map(i => i.id));
+  }
+
+  function setStatus(ok, text) {
+    const s = document.getElementById("status");
+    s.className = "status" + (ok ? "" : " err");
+    s.innerHTML = '<span class="dot"></span>'; s.append(text);
+  }
+
+  async function refresh() {
+    try {
+      const r = await fetch(API, { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      render(await r.json());
+      setStatus(true, "updated " + new Date().toLocaleTimeString());
+    } catch (e) {
+      setStatus(false, "API unreachable (" + e.message + ") – retrying in 30 s");
+    }
+  }
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>
