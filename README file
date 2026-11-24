@@ -1,1 +1,374 @@
+# BloodCell pipeline – Event-driven ML pipeline on Azure
+
+**ECE Paris – Distributed Systems and AI – Capstone project 2026–2027**
+Team `bcellaj` · Apiramy Jeyaharan · Thavamani Thapasuraman · Rajarethinam UDAIYAKUMAR .
+BALASUNDARAM Nanadaa .
+
+A microscope image of a blood cell dropped into Azure Blob Storage is **validated, queued, classified by a containerised ML API, stored, and shown on a live dashboard** – automatically, monitored, deployed from GitHub, for a few cents.
+
+| | Link |
+|---|---|
+| Live dashboard | https://stbcellajpipe.z28.web.core.windows.net |
+| ML API (Container Apps) | https://api-bcellaj.politegrass-8d42c874.francecentral.azurecontainerapps.io/docs |
+| Recent inferences (Function) | https://func-bcellaj.azurewebsites.net/api/recent |
+
+---
+
+## 1. Architecture
+
+```mermaid
+flowchart LR
+    U([User / script]) -->|upload .png/.jpg| IN[(Blob Storage<br/>input/)]
+    IN -->|BlobCreated<br/>filter: /containers/input/| EG{{Event Grid<br/>system topic}}
+    EG --> D[dispatcher<br/>Event Grid trigger]
+    D -->|invalid| REJ[(rejected/<br/>+ .reason.json)]
+    D -->|valid: JSON message| Q[[Storage Queue<br/>inference-requests]]
+    Q --> W[worker<br/>queue trigger]
+    Q -. 5 failed attempts .-> PQ[[inference-requests-poison]]
+    W -->|POST /predict| API[ML API – FastAPI + ONNX<br/>Container Apps 0→2 replicas]
+    W --> OUT[(output/*.json)]
+    W -->|upsert| DB[(Cosmos DB Free Tier<br/>pipeline/inferences)]
+    DB --> R[recent<br/>HTTP GET /api/recent]
+    R --> WEB[Dashboard<br/>static site $web + Chart.js]
+
+    subgraph Function App – Flex Consumption, Python 3.12
+      D
+      W
+      R
+    end
+```
+
+Cross-cutting: **Application Insights** (OpenTelemetry, custom metrics, alert), **GitHub Actions** (CI + OIDC deployment), **managed identities** (no keys in code), **budget** with alerts.
+
+| # | Service | Resource | Configuration |
+|---|---|---|---|
+| 1 | Blob Storage | `stbcellajpipe` | Standard LRS, hot, versioning on; containers `input`, `output`, `rejected`, `models`, `$web` |
+| 2 | Event Grid | `blob-to-dispatcher` | `Microsoft.Storage.BlobCreated`, subject begins with `/blobServices/default/containers/input/` |
+| 3 | Storage Queue | `inference-requests` (+ `-poison`) | `maxDequeueCount = 5`, visibility timeout 10 s |
+| 4 | Function App | `func-bcellaj` | Flex Consumption, Python 3.12, 512 MB, 3 functions, system-assigned identity |
+| 5 | ML API | `api-bcellaj` in `cae-bcellaj` | Container Apps Consumption, 0.25 vCPU / 0.5 GiB, **min 0 / max 2 replicas**, probes on `/health` |
+| 6 | Results | `output/` | full JSON result per file (with all class probabilities) |
+| 7 | Cosmos DB | `cosmos-bcellaj` | **Free Tier**, database `pipeline` (400 RU/s shared), container `inferences`, partition key `/fileName` |
+| 8 | Dashboard | `$web` | static HTML/JS, refresh every 30 s, CORS on `/api/recent` restricted to the site origin |
+| – | Monitoring | `log-bcellaj`, `appi-bcellaj` | workspace-based App Insights, **daily cap 0.2 GB** |
+
+---
+
+## 2. Region choice
+
+**Region: `francecentral` (Paris).**
+
+| Check (section 3.2) | Result |
+|---|---|
+| Allowed locations of the subscription (policy) | `germanywestcentral`, **`francecentral`**, `austriaeast`, `polandcentral`, `norwayeast` |
+| Flex Consumption available (`az functionapp list-flexconsumption-locations`) | `francecentral` ✅ (all 5 allowed regions are in the list) |
+| Cosmos DB created first, with the CLI, to validate capacity | ✅ Free Tier accepted on the first attempt |
+
+Why France Central: in both lists, closest to the users (Paris → lowest latency for the demo), Cosmos DB capacity accepted immediately, and data stays in France. Fallback planned: `germanywestcentral`.
+
+---
+
+## 3. Dataset and model
+
+- **Dataset:** [BloodMNIST](https://medmnist.com/) (MedMNIST v2) – 17,092 microscope images of blood cells, 28×28 RGB, **8 classes** (basophil, eosinophil, erythroblast, immature granulocytes, lymphocyte, monocyte, neutrophil, platelet). Official split: 11,959 train / 1,712 validation / 3,421 test.
+- **Licence:** CC BY 4.0. Citation: J. Yang et al., *MedMNIST v2 – A large-scale lightweight benchmark for 2D and 3D biomedical image classification*, Scientific Data, 2023. ⚠️ Research/education only – **not for clinical use**.
+- **Task:** multi-class image classification.
+- **Training:** Google Colab (T4 GPU) – [`model/bloodmnist_training.ipynb`](model/bloodmnist_training.ipynb). Reproducible: fixed seed 42, pinned [`model/requirements.txt`](model/requirements.txt), official test set never used for model selection (best epoch and best model chosen on the validation set by macro-F1).
+
+### Results on the test set (3,421 images)
+
+| Model | Accuracy | Macro-F1 |
+|---|---|---|
+| Baseline 1 – most frequent class | 0.195 | 0.041 |
+| Baseline 2 – PCA (100) + logistic regression | 0.774 | 0.744 |
+| Small CNN (from scratch, ~0.3 M params) | 0.970 | 0.968 |
+| **ResNet-18 fine-tuned (ImageNet weights) – selected** | **0.971** | **0.969** |
+| Final ONNX export (same predictions) | 0.971 | 0.969 |
+
+Macro-F1 is reported because the classes are imbalanced (accuracy alone would hide weak small classes). Confusion matrix: [`docs/confusion_matrix.png`](docs/confusion_matrix.png).
+
+### Exported model
+
+| | |
+|---|---|
+| File | `model/model-1.0.0.onnx` (semantic version **1.0.0**) |
+| Size | 44.7 MB (< 100 MB) |
+| CPU latency (1 thread) | **5.5 ms mean, 6.3 ms p95** (< 1 s) |
+| Input | `image` float32 `(batch, 3, 28, 28)` in [0, 1] – resize + normalisation are **inside** the ONNX graph |
+| Output | `probabilities` float32 `(batch, 8)` – softmax inside the graph |
+| Contract | [`model/input_schema.json`](model/input_schema.json) (shared by the dispatcher and the API) |
+
+---
+
+## 4. Repository structure
+
+```
+model/        training notebook, requirements, model-1.0.0.onnx, labels, metrics, input schema
+api/          FastAPI app, tests (pytest), multi-stage Dockerfile
+functions/    function_app.py (dispatcher, worker, recent), pipeline.py, host.json, tests
+web/          static dashboard (index.html + Chart.js)
+.github/workflows/  ci.yml, deploy.yml
+infra/        commented az commands
+docs/         screenshots, KQL queries, cost report, time log
+```
+
+---
+
+## 5. ML API (`/api`)
+
+| Endpoint | Returns |
+|---|---|
+| `GET /health` | status + model loading time (liveness and readiness probes) |
+| `GET /version` | API version, model version, **git SHA of the deployed commit** |
+| `POST /predict` | `{"file_name", "image_base64"}` → cell type, confidence, 8 probabilities, latency |
+| `GET /metrics` | number of calls, successes, errors, average latency |
+
+- Pydantic validation (invalid base64, oversized image, missing field, missing body → **422**); 9 pytest tests.
+- Multi-stage Dockerfile on `python:3.12-slim`, non-root user (uid 10001), `HEALTHCHECK`, ONNX Runtime instead of PyTorch → small image.
+- Configuration through environment variables only; the Application Insights connection string is a **Container Apps secret**.
+- Telemetry: `azure-monitor-opentelemetry` + custom metrics `inferences_total`, `model_latency_ms`, `prediction_errors_total`.
+
+### curl example
+
+```bash
+API=https://api-bcellaj.politegrass-8d42c874.francecentral.azurecontainerapps.io
+IMG=$(base64 -w0 docs/demo_images/neutrophil_0.png)
+curl -X POST $API/predict -H "Content-Type: application/json" \
+  -d "{\"file_name\":\"neutrophil_0.png\",\"image_base64\":\"$IMG\"}"
+```
+
+```json
+{"file_name":"neutrophil_0.png","class_id":6,"cell_type":"neutrophil","confidence":0.97,
+ "probabilities":{"basophil":0.001,"...":"...","neutrophil":0.97},"model_version":"1.0.0","inference_ms":6.9}
+```
+
+Scale to zero: [`docs/api_replicas_zero.png`](docs/api_replicas_zero.png).
+
+---
+
+## 6. Event-driven pipeline (`/functions`)
+
+One Flex Consumption Function App, Python 3.12, v2 programming model, three functions:
+
+| Function | Trigger | Role |
+|---|---|---|
+| `dispatcher` | Event Grid (`BlobCreated` on `input/`) | checks **extension** (.png/.jpg/.jpeg), **size** (≤ 1 MB, not empty), **schema** (really a PNG/JPEG, 8–4096 px). Valid → message to `inference-requests`. Invalid → copy to `rejected/` + `<name>.reason.json` |
+| `worker` | queue `inference-requests` | **idempotent** (id = SHA-256 of blob name + ETag; skips if already in Cosmos; upsert write), reused HTTP client with **timeout**, calls `/predict`, writes `output/<name>.json` and the metadata to Cosmos DB, emits metrics |
+| `recent` | HTTP `GET /api/recent` | last 20 inferences, CORS restricted to the dashboard origin |
+
+### Example Event Grid event (input of the dispatcher)
+
+```json
+{
+  "topic": "/subscriptions/<sub>/resourceGroups/rg-projet-bcellaj/providers/Microsoft.Storage/storageAccounts/stbcellajpipe",
+  "subject": "/blobServices/default/containers/input/blobs/neutrophil_0.png",
+  "eventType": "Microsoft.Storage.BlobCreated",
+  "eventTime": "2026-11-20T12:55:54.000Z",
+  "data": {
+    "api": "PutBlob",
+    "contentType": "image/png",
+    "contentLength": 1782,
+    "blobType": "BlockBlob",
+    "eTag": "0x8DF47059185DE59",
+    "url": "https://stbcellajpipe.blob.core.windows.net/input/neutrophil_0.png"
+  },
+  "dataVersion": "", "metadataVersion": "1"
+}
+```
+
+### Example queue message (dispatcher → worker)
+
+```json
+{"blob_name": "neutrophil_0.png", "etag": "0x8DF47059185DE59", "size": 1782, "event_time": "2026-11-20T12:55:54+00:00"}
+```
+
+### Example Cosmos DB document
+
+```json
+{"id": "e7e9151d8c36ac425432642191bbb8fd", "fileName": "neutrophil_0.png", "etag": "0x8DF47059185DE59",
+ "timestamp": "2026-11-20T12:56:03.350+00:00", "day": "2026-11-20", "prediction": "monocyte", "classId": 5,
+ "confidence": 0.4612, "modelVersion": "1.0.0", "modelLatencyMs": 6.96, "durationMs": 8722.8, "sizeBytes": 1782}
+```
+
+### Retries and poison queue – failure scenario
+
+`host.json`: `maxDequeueCount = 5`, `visibilityTimeout = 10 s`. If the worker raises (API unreachable, timeout, HTTP 5xx, unreadable message), the message becomes visible again and is retried; after **5 failed attempts** the Functions runtime moves it to **`inference-requests-poison`** (dead-letter queue), where it can be inspected and replayed.
+
+Demonstrated scenario: a message that is not valid JSON was put in the queue
+(`az storage message put -q inference-requests --content "bm90IGpzb24="`, i.e. "not json" in base64) → 5 failed attempts → message in the poison queue ([`docs/pipeline_poison.png`](docs/pipeline_poison.png)).
+
+| Scenario | Evidence |
+|---|---|
+| Valid upload → result in < 1 min | [`docs/pipeline_output.png`](docs/pipeline_output.png) |
+| Invalid upload → `rejected/` + reason | [`docs/pipeline_rejected.png`](docs/pipeline_rejected.png) |
+| Poisoned message → `-poison` queue | [`docs/pipeline_poison.png`](docs/pipeline_poison.png) |
+| New upload appears on the dashboard automatically | [`docs/dashboard.png`](docs/dashboard.png) |
+
+### No secret in the repository
+
+All Azure access from the Function App uses its **system-assigned managed identity** (`DefaultAzureCredential`): `Storage Blob Data Owner` and `Storage Queue Data Contributor` on the storage account, **Cosmos DB Built-in Data Contributor** (data-plane role) on the Cosmos account. Queue trigger and output use an identity-based connection (`PIPELINE_STORAGE__queueServiceUri`). Settings are application settings, never in Git.
+
+---
+
+## 7. Observability
+
+- One Log Analytics workspace `log-bcellaj` (**daily cap 0.2 GB**) and one workspace-based Application Insights `appi-bcellaj`, both created explicitly in the project resource group, connected to the API and the Function App.
+- **Custom metrics** (OpenTelemetry): API → `inferences_total`, `model_latency_ms`, `prediction_errors_total`; worker → `pipeline_inferences_total`, `pipeline_duration_ms`, `pipeline_errors_total`; dispatcher → `pipeline_rejected_total`.
+- **Alert** `alert-api-errors`: log alert evaluated every 15 min, fires when there are **more than 3 HTTP errors (4xx/5xx) in 15 minutes**, email via action group `ag-bcellaj`. Deliberately triggered with 10 invalid `/predict` calls (HTTP 422) → **Fired** ([`docs/alert_3_portal.png`](docs/alert_3_portal.png), [`docs/alert_2_email.png`](docs/alert_2_email.png)).
+
+### KQL queries (full file: [`docs/kql_queries.md`](docs/kql_queries.md))
+
+**1. Inferences per hour** – [`docs/kql_1_inferences_per_hour.png`](docs/kql_1_inferences_per_hour.png)
+```kusto
+traces
+| where timestamp > ago(7d)
+| where message startswith "worker: " and message has " -> "
+| summarize inferences = count() by bin(timestamp, 1h)
+| render columnchart
+```
+
+**2. The 5 slowest files** – [`docs/kql_2_slowest_files.png`](docs/kql_2_slowest_files.png)
+```kusto
+traces
+| where timestamp > ago(7d)
+| where message startswith "worker: " and message has " -> "
+| parse message with "worker: " file " -> " prediction " (" confidence ") in " duration_ms:real " ms"
+| top 5 by duration_ms desc
+| project timestamp, file, prediction, confidence, duration_ms
+```
+
+**3. Distribution of HTTP codes** – [`docs/kql_3_http_codes.png`](docs/kql_3_http_codes.png)
+```kusto
+requests
+| where timestamp > ago(7d)
+| summarize calls = count() by resultCode, cloud_RoleName
+| order by calls desc
+| render piechart
+```
+
+---
+
+## 8. CI/CD and security
+
+| Workflow | Trigger | Steps |
+|---|---|---|
+| [`ci.yml`](.github/workflows/ci.yml) | push and pull request on `main` | ruff + pytest for `api/` and `functions/` → build the image; on push, publish to **GHCR** `ghcr.io/apira1899/bloodcell-pipeline/api` tagged `1.0.0` and the commit SHA |
+| [`deploy.yml`](.github/workflows/deploy.yml) | after a successful CI run on `main` (or manual) | environment **`production`** (required reviewer = manual approval) → **Azure login through OIDC** → `az containerapp update` with the image of this commit → Function App zip deployment → smoke test: `GET /version` must return the deployed `git_sha` |
+
+- **No Azure secret in GitHub.** GitHub logs in with the user-assigned managed identity `id-github-bcellaj` and a **federated credential** (OIDC). The 3 GitHub secrets are non-sensitive identifiers: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`.
+- **Least privilege:** the GitHub identity is **Contributor on the resource group only** and cannot create role assignments; role assignments (Function App → Storage / Cosmos DB) were created once by the subscription owner.
+- Public repository → `production` environment with a required reviewer.
+- Proof: a commit on `main` changes `GET /version` → `git_sha` ([`docs/deploy_version.png`](docs/deploy_version.png)).
+
+---
+
+## 9. Deployment – step by step
+
+Prerequisites: Azure for Students subscription (owner), Azure Cloud Shell (Bash), GitHub account. Full commented script: [`infra/`](infra/).
+
+```bash
+# 0. Variables (Cloud Shell forgets them when it restarts: paste again each session)
+EQ=bcellaj; LOC=francecentral; RG=rg-projet-$EQ; ST=st${EQ}pipe; COSMOS=cosmos-$EQ
+ENV=cae-$EQ; FUNC=func-$EQ; ID=id-github-$EQ; LAW=log-$EQ; AI=appi-$EQ
+
+# 1. Region checks + providers (section 3.2 of the subject)
+az policy assignment list --disable-scope-strict-match --query "[?contains(displayName,'region') || contains(displayName,'location')].parameters" -o json
+az functionapp list-flexconsumption-locations -o table
+
+# 2. Resource group (tags) and Cosmos DB FIRST (Free Tier, CLI)
+az group create -n $RG -l $LOC --tags projet=dscc equipe=$EQ
+az cosmosdb create -n $COSMOS -g $RG --enable-free-tier true --locations regionName=$LOC failoverPriority=0 isZoneRedundant=False
+az cosmosdb sql database create -a $COSMOS -g $RG -n pipeline --throughput 400
+az cosmosdb sql container create -a $COSMOS -g $RG -d pipeline -n inferences --partition-key-path /fileName
+
+# 3. Storage: containers, queues, versioning, static website
+az storage account create -n $ST -g $RG -l $LOC --sku Standard_LRS --kind StorageV2 --min-tls-version TLS1_2 --allow-blob-public-access false
+az storage account blob-service-properties update -n $ST -g $RG --enable-versioning true
+for c in input output rejected models; do az storage container create --account-name $ST -n $c; done
+az storage queue create --account-name $ST -n inference-requests
+az storage queue create --account-name $ST -n inference-requests-poison
+az storage blob service-properties update --account-name $ST --static-website --index-document index.html
+
+# 4. Monitoring (capped workspace + App Insights) BEFORE the apps
+az monitor log-analytics workspace create -g $RG -n $LAW -l $LOC --quota 0.2
+az monitor app-insights component create --app $AI -g $RG -l $LOC --workspace $(az monitor log-analytics workspace show -g $RG -n $LAW --query id -o tsv)
+
+# 5. Container Apps environment + API (image built by ci.yml, public on GHCR)
+az containerapp env create -n $ENV -g $RG -l $LOC --logs-workspace-id <customerId> --logs-workspace-key <key>
+az containerapp create -n api-$EQ -g $RG --environment $ENV --image ghcr.io/apira1899/bloodcell-pipeline/api:1.0.0 \
+  --target-port 8000 --ingress external --cpu 0.25 --memory 0.5Gi --min-replicas 0 --max-replicas 2 \
+  --secrets appinsights-conn="<connection string>" --env-vars APPLICATIONINSIGHTS_CONNECTION_STRING=secretref:appinsights-conn
+#    + liveness/readiness probes on /health (az rest PATCH of the template)
+
+# 6. Function App (Flex Consumption) + identity + roles + settings + code
+az functionapp create -n $FUNC -g $RG --storage-account $ST --app-insights $AI --flexconsumption-location $LOC --runtime python --runtime-version 3.12 --instance-memory 512
+az functionapp identity assign -n $FUNC -g $RG        # then the 3 role assignments (section 6)
+az functionapp config appsettings set -n $FUNC -g $RG --settings STORAGE_ACCOUNT_URL=... PIPELINE_STORAGE__queueServiceUri=... API_URL=... COSMOS_ENDPOINT=...
+az functionapp deployment source config-zip -g $RG -n $FUNC --src functions.zip --build-remote true
+
+# 7. Event Grid -> dispatcher (only after the code is deployed)
+az eventgrid event-subscription create -n blob-to-dispatcher --source-resource-id <storage id> --endpoint-type azurefunction \
+  --endpoint <function app id>/functions/dispatcher --included-event-types Microsoft.Storage.BlobCreated \
+  --subject-begins-with /blobServices/default/containers/input/
+
+# 8. Dashboard + CORS
+az storage blob upload --account-name $ST -c '$web' -f web/index.html -n index.html --content-type text/html
+az functionapp cors add -n $FUNC -g $RG --allowed-origins https://stbcellajpipe.z28.web.core.windows.net
+
+# 9. GitHub OIDC identity (Contributor on the resource group only)
+az identity create -n $ID -g $RG
+az identity federated-credential create -n github-production-ids --identity-name $ID -g $RG \
+  --issuer https://token.actions.githubusercontent.com \
+  --subject "repo:Apira1899@132703325/bloodcell-pipeline@1465266331:environment:production" --audiences api://AzureADTokenExchange
+az role assignment create --role Contributor --assignee-object-id <principalId> --assignee-principal-type ServicePrincipal --scope <resource group id>
+
+# 10. Alert (action group + log alert every 15 min) and budget ($25, alerts 20/50/80 %)
+```
+
+---
+
+## 10. Azure for Students restrictions encountered and solutions
+
+| Restriction / problem | What we saw | Solution applied |
+|---|---|---|
+| Only 5 allowed regions | policy `listOfAllowedLocations` | Chose `francecentral` (allowed + Flex Consumption + closest) |
+| Cosmos DB: portal may offer only EUAP regions | – | Created Cosmos DB **first, with the CLI**, in `francecentral`: Free Tier accepted |
+| No Entra ID rights (no service principal) | – | GitHub → Azure through a **user-assigned managed identity + federated credential (OIDC)** |
+| **OIDC subject mismatch** `AADSTS700213` | GitHub now sends `repo:Apira1899@132703325/bloodcell-pipeline@1465266331:environment:production` (immutable owner/repo IDs) | Added a federated credential with **the exact subject printed by `azure/login`** |
+| ACR Tasks unavailable / ACR costs ≈ $0.17/day | – | Image built in GitHub Actions and pushed to **GHCR** (free, public) |
+| Static Web Apps often outside allowed regions | – | Dashboard hosted in the storage **`$web` static website** |
+| One Container Apps environment only | – | Single environment `cae-bcellaj` |
+| Contributor cannot assign roles | – | Role assignments created once by the subscription owner; GitHub identity = Contributor on the group only |
+| Python 3.12 runtime on Flex Consumption | remote build failed: `azure-functions==2.4.0` requires Python ≥ 3.13 | Pinned `azure-functions==1.26.0` |
+| Cloud Shell is ephemeral | variables lost after each disconnection (`expected one argument` errors) | Variables block kept in a text file and pasted at the start of every session |
+| CLI extensions prompt (Y/n) in Cloud Shell | a hidden prompt blocked a command | `az config set extension.use_dynamic_install=yes_without_prompt` |
+| A budget named `budget-dscc` already existed in the subscription | – | Created `budget-bcellaj` scoped to the project resource group |
+| $100 credit shared with all courses | – | Budget $25 + alerts 20/50/80 %, App Insights cap 0.2 GB/day, scale to zero, deletion after the defence |
+
+---
+
+## 11. Costs
+
+Budget `budget-bcellaj`: **$25** on the resource group, alerts at 20 %, 50 %, 80 %. Tags `projet=dscc`, `equipe=bcellaj`.
+Initial estimate ≈ **$0–3** for 15 days (Functions, Container Apps, Event Grid and Cosmos DB within free grants; storage < $0.20; alert < $0.50).
+Actual cost on D15 and proof of deletion: [`docs/cost_report.md`](docs/cost_report.md).
+
+Clean-up after the defence:
+```bash
+az group delete -n rg-projet-bcellaj --yes
+az group exists -n rg-projet-bcellaj          # -> false
+az group list -o table                        # no leftover DefaultResourceGroup-*
+```
+
+---
+
+## 12. Team and time log
+
+| Member | Main parts |
+|---|---|
+| Apiramy Jeyaharan | Model training, ML API, Azure infrastructure, Function App pipeline, CI/CD |
+| _<teammate 2>_ | _<part>_ |
+| _<teammate 3>_ | _<part>_ |
+
+Time log: [`docs/time_log.md`](docs/time_log.md).
 
